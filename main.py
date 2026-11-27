@@ -2,6 +2,8 @@ import os
 import time
 import random
 import binascii
+import sqlite3
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -42,6 +44,50 @@ class HeartbeatRequest(BaseModel):
 
 class CloseRoomRequest(BaseModel):
     room_id: str
+
+class LeaderboardSubmission(BaseModel):
+    game_id: int
+    game_title: str
+    platform: str
+    player_name: str
+    score_raw: int
+    score_display: str
+    score_type: str = "score"
+    session_duration_sec: int = 0
+    proof_hash: str = ""
+    client_version: str = "0.60.0"
+
+DB_PATH = os.environ.get("RETROHUB_LEADERBOARD_DB", "leaderboard.db")
+
+def get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS leaderboard_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            game_id INTEGER NOT NULL,
+            game_title TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            player_name TEXT NOT NULL,
+            score_raw INTEGER NOT NULL,
+            score_display TEXT NOT NULL,
+            score_type TEXT NOT NULL DEFAULT 'score',
+            proof_hash TEXT NOT NULL DEFAULT '',
+            client_version TEXT NOT NULL DEFAULT '',
+            achieved_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_lb_game ON leaderboard_records(game_id, score_raw DESC)")
+    conn.commit()
+    return conn
+
+try:
+    _init_conn = get_db()
+    _init_conn.close()
+except Exception:
+    DB_PATH = "/tmp/leaderboard.db"
+    _init_conn = get_db()
+    _init_conn.close()
 
 class LobbyRoom(BaseModel):
     id: str
@@ -182,6 +228,88 @@ def close_room(req: CloseRoomRequest):
         rooms.pop(req.room_id, None)
         return {"status": "closed", "room_id": req.room_id}
     return {"status": "already_closed"}
+
+@app.post("/api/leaderboard/submit")
+def submit_leaderboard(req: LeaderboardSubmission):
+    if req.score_raw <= 0 or req.score_raw > 50_000_000_000:
+        raise HTTPException(status_code=400, detail="Punteggio non valido")
+    p_name = req.player_name.strip()[:24] or "Player"
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    conn = get_db()
+    try:
+        cur = conn.execute(
+            "SELECT id, score_raw FROM leaderboard_records WHERE game_id = ? AND LOWER(player_name) = LOWER(?) ORDER BY score_raw DESC LIMIT 1",
+            (req.game_id, p_name),
+        )
+        row = cur.fetchone()
+        if row and row["score_raw"] >= req.score_raw:
+            return {"status": "ok", "accepted": True, "is_new_best": False}
+        if row:
+            conn.execute(
+                """UPDATE leaderboard_records
+                   SET score_raw = ?, score_display = ?, game_title = ?, platform = ?, proof_hash = ?, client_version = ?, achieved_at = ?
+                   WHERE id = ?""",
+                (req.score_raw, req.score_display, req.game_title, req.platform, req.proof_hash, req.client_version, now_iso, row["id"]),
+            )
+        else:
+            conn.execute(
+                """INSERT INTO leaderboard_records
+                   (game_id, game_title, platform, player_name, score_raw, score_display, score_type, proof_hash, client_version, achieved_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (req.game_id, req.game_title, req.platform, p_name, req.score_raw, req.score_display, req.score_type, req.proof_hash, req.client_version, now_iso),
+            )
+        conn.commit()
+        return {"status": "ok", "accepted": True, "is_new_best": True}
+    finally:
+        conn.close()
+
+@app.get("/api/leaderboard/global")
+def get_global_leaderboard(limit: int = 25):
+    lim = max(1, min(limit, 100))
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT game_id, game_title, platform, player_name, score_raw, score_display, achieved_at
+               FROM leaderboard_records
+               ORDER BY score_raw DESC
+               LIMIT ?""",
+            (lim,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+@app.get("/api/leaderboard/{game_id}")
+def get_game_leaderboard(game_id: int, limit: int = 25):
+    lim = max(1, min(limit, 100))
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT player_name, score_raw, score_display, achieved_at
+               FROM leaderboard_records
+               WHERE game_id = ?
+               ORDER BY score_raw DESC
+               LIMIT ?""",
+            (game_id, lim),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+@app.get("/api/players/available")
+def check_player_available(name: str):
+    clean = name.strip()
+    if not clean:
+        return {"available": False}
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM leaderboard_records WHERE LOWER(player_name) = LOWER(?) LIMIT 1",
+            (clean,),
+        ).fetchone()
+        return {"available": row is None, "name": clean}
+    finally:
+        conn.close()
 
 if __name__ == "__main__":
     import uvicorn
